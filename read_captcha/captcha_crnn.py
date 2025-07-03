@@ -1,63 +1,90 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 from __future__ import annotations
-import argparse, string
+import argparse, string, random
 from pathlib import Path
 from typing import List
-import cv2, torch
+import cv2, numpy as np, torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
+# ----------------------------- Constants -----------------------------
 ALPHABET = string.ascii_uppercase + string.ascii_lowercase + string.digits
 BLANK = "_"
 CHARS = BLANK + ALPHABET
-CHAR2IDX = {c: i for i, c in enumerate(CHARS)}
-IDX2CHAR = {i: c for c, i in CHAR2IDX.items()}
+C2I = {c: i for i, c in enumerate(CHARS)}
+I2C = {i: c for c, i in C2I.items()}
 IMG_H = 32
 BATCH = 32
 LR = 1e-3
 
-# ---------- preprocessing ----------
+# --------------------------- Pre‑processing ---------------------------
 
-def preprocess(p: Path) -> torch.Tensor:
-    g = cv2.imread(str(p), 0)
+def maybe_invert(img: np.ndarray) -> np.ndarray:
+    return 255 - img if img.mean() < 100 else img
+
+
+def augment(img: np.ndarray) -> np.ndarray:
+    h, w = img.shape
+    if random.random() < 0.3:
+        M = cv2.getRotationMatrix2D((w / 2, h / 2), random.uniform(-5, 5), 1)
+        img = cv2.warpAffine(img, M, (w, h), borderValue=255)
+    if random.random() < 0.3:
+        tx, ty = random.randint(-2, 2), random.randint(-2, 2)
+        M = np.float32([[1, 0, tx], [0, 1, ty]])
+        img = cv2.warpAffine(img, M, (w, h), borderValue=255)
+    if random.random() < 0.3:
+        noise = np.random.normal(0, 5, img.shape).astype(np.int16)
+        img = np.clip(img.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+    return img
+
+
+def preprocess(path: Path, train: bool = False) -> torch.Tensor:
+    g = cv2.imread(str(path), 0)
     if g is None:
-        raise FileNotFoundError(p)
-    # ensure letters are dark (low values), background light; invert only if background darker
-    if g.mean() < 127:
-        g = 255 - g
+        raise FileNotFoundError(path)
+    g = maybe_invert(g)
+    if train:
+        g = augment(g)
     h, w = g.shape
     g = cv2.resize(g, (int(w * IMG_H / h), IMG_H), cv2.INTER_AREA)
+    g = cv2.equalizeHist(g)
     return torch.from_numpy(g.astype("float32") / 255.0).unsqueeze(0)
 
-# ---------- dataset ---------------
+# ------------------------------- Dataset -----------------------------
 
-def t2i(t: str) -> List[int]:
-    return [CHAR2IDX[c] for c in t]
+def txt2idx(txt: str) -> List[int]:
+    return [C2I[c] for c in txt]
 
-def i2t(v: List[int]) -> str:
-    return "".join(IDX2CHAR[i] for i in v if i)
+
+def idx2txt(seq: List[int]) -> str:
+    return "".join(I2C[i] for i in seq if i)
+
 
 class CaptchaDS(Dataset):
-    def __init__(self, root: Path):
-        self.files = sorted([q for ext in ("*.png", "*.jpg", "*.jpeg") for q in root.glob(ext)])
+    def __init__(self, root: Path, train: bool = False):
+        self.files = sorted([p for ext in ("*.png", "*.jpg", "*.jpeg") for p in root.glob(ext)])
+        self.train = train
+
     def __len__(self):
         return len(self.files)
-    def __getitem__(self, i):
-        p = self.files[i]
-        return preprocess(p), torch.tensor(t2i(p.stem)), p.stem
 
-def pad(batch):
+    def __getitem__(self, idx):
+        p = self.files[idx]
+        return preprocess(p, self.train), torch.tensor(txt2idx(p.stem)), p.stem
+
+
+def collate(batch):
     imgs, tgts, labels = zip(*batch)
-    mw = max(i.shape[-1] for i in imgs)
-    imgs = torch.stack([F.pad(i, (0, mw - i.shape[-1]), value=1.0) for i in imgs])
-    return imgs, torch.cat(tgts), torch.tensor([len(t) for t in tgts]), labels
+    max_w = max(i.shape[-1] for i in imgs)
+    imgs = torch.stack([F.pad(i, (0, max_w - i.shape[-1]), value=1.0) for i in imgs])
+    tgt_lens = torch.tensor([len(t) for t in tgts], dtype=torch.long)
+    return imgs, torch.cat(tgts), tgt_lens, labels
 
-# ---------- model -----------------
+# -------------------------------- Model ------------------------------
 
 class CRNN(nn.Module):
-    def __init__(self, n: int = len(CHARS)):
+    def __init__(self, n_class: int = len(CHARS)):
         super().__init__()
         self.cnn = nn.Sequential(
             nn.Conv2d(1, 64, 3, 1, 1), nn.ReLU(), nn.MaxPool2d(2, 2),
@@ -69,13 +96,14 @@ class CRNN(nn.Module):
             nn.Conv2d(512, 512, 2, 1, 0), nn.ReLU(),
         )
         self.rnn = nn.LSTM(512, 256, num_layers=2, bidirectional=True)
-        self.fc = nn.Linear(512, n)
-    def forward(self, x):
-        f = self.cnn(x).squeeze(2).permute(2, 0, 1)
+        self.fc = nn.Linear(512, n_class)
+
+    def forward(self, x):  # x: [B, 1, H, W]
+        f = self.cnn(x).squeeze(2).permute(2, 0, 1)  # [W', B, 512]
         f, _ = self.rnn(f)
         return self.fc(f)
 
-# ---------- utils -----------------
+# ------------------------------- Decode ------------------------------
 
 def decode(logits: torch.Tensor) -> str:
     _, idx = logits.softmax(2).max(2)
@@ -84,68 +112,90 @@ def decode(logits: torch.Tensor) -> str:
         if i != prev and i != 0:
             seq.append(i)
         prev = i
-    return i2t(seq)
+    return idx2txt(seq)
 
-def eval_loop(net, loader, crit, dev):
-    net.eval(); tot = 0.0; ok = 0; tot_n = 0
+# ------------------------------ Evaluate -----------------------------
+
+def evaluate(net: nn.Module, loader: DataLoader, crit, dev):
+    net.eval(); total, correct, n = 0.0, 0, 0
     with torch.no_grad():
-        for imgs, tgts, lens, labels in loader:
-            imgs, tgts, lens = imgs.to(dev), tgts.to(dev), lens.to(dev)
-            out = net(imgs).log_softmax(2)
-            T, B, _ = out.size(); inp = torch.full((B,), T, dtype=torch.long, device=dev)
-            tot += crit(out, tgts, inp, lens).item()
+        for imgs, tgts, tgt_lens, labels in loader:
+            imgs, tgts, tgt_lens = imgs.to(dev), tgts.to(dev), tgt_lens.to(dev)
+            logits = net(imgs).log_softmax(2)
+            T, B, _ = logits.size(); inp_lens = torch.full((B,), T, dtype=torch.long, device=dev)
+            total += crit(logits, tgts, inp_lens, tgt_lens).item()
             for b in range(B):
-                if decode(out[:, b:b+1, :]) == labels[b]:
-                    ok += 1
-                tot_n += 1
-    return tot / len(loader), ok / tot_n if tot_n else 0.0
+                if decode(logits[:, b:b + 1, :]) == labels[b]:
+                    correct += 1
+                n += 1
+    return total / len(loader), correct / n if n else 0.0
 
-# ---------- train -----------------
+# -------------------------------- Train ------------------------------
 
-def train(data: Path, epochs: int, sav: Path):
-    dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu'); print('Using device:', dev)
-    tr_ld = DataLoader(CaptchaDS(data), BATCH, True, collate_fn=pad, num_workers=2)
-    val_dir = data / 'val'
-    val_ld = DataLoader(CaptchaDS(val_dir), BATCH, False, collate_fn=pad, num_workers=2) if val_dir.exists() else None
+def train(data: Path, epochs: int, out: Path):
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu"); print("Using device:", dev)
+    train_ld = DataLoader(CaptchaDS(data, True), BATCH, True, collate_fn=collate, num_workers=2)
+    val_dir = data / "val"
+    val_ld = DataLoader(CaptchaDS(val_dir), BATCH, False, collate_fn=collate, num_workers=2) if val_dir.exists() else None
+
     net, crit = CRNN().to(dev), nn.CTCLoss(blank=0, zero_infinity=True)
     opt = torch.optim.Adam(net.parameters(), LR)
-    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.1, patience=3)
-    for ep in range(1, epochs + 1):
-        net.train(); s = 0.0
-        for imgs, tgts, lens, _ in tr_ld:
-            imgs, tgts, lens = imgs.to(dev), tgts.to(dev), lens.to(dev)
-            out = net(imgs).log_softmax(2)
-            T, B, _ = out.size(); inp = torch.full((B,), T, dtype=torch.long, device=dev)
-            loss = crit(out, tgts, inp, lens)
-            opt.zero_grad(); loss.backward(); opt.step(); s += loss.item()
-        tr = s / len(tr_ld)
-        if val_ld:
-            vl, acc = eval_loop(net, val_ld, crit, dev)
-            print(f"Ep {ep}/{epochs} train={tr:.3f} val={vl:.3f} acc={acc:.2%}"); sched.step(vl)
-        else:
-            print(f"Ep {ep}/{epochs} train={tr:.3f}"); sched.step(tr)
-    torch.save(net.state_dict(), sav)
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode='min', factor=0.1, patience=3)
 
-# ---------- predict ---------------
+    for ep in range(1, epochs + 1):
+        net.train(); running = 0.0
+        for imgs, tgts, tgt_lens, _ in train_ld:
+            imgs, tgts, tgt_lens = imgs.to(dev), tgts.to(dev), tgt_lens.to(dev)
+            logits = net(imgs).log_softmax(2)
+            T, B, _ = logits.size(); inp_lens = torch.full((B,), T, dtype=torch.long, device=dev)
+            loss = crit(logits, tgts, inp_lens, tgt_lens)
+            opt.zero_grad(); loss.backward(); opt.step()
+            running += loss.item()
+        train_loss = running / len(train_ld)
+
+        if val_ld:
+            val_loss, val_acc = evaluate(net, val_ld, crit, dev)
+            print(f"Ep {ep}/{epochs} train={train_loss:.3f} val={val_loss:.3f} acc={val_acc:.2%}")
+            sched.step(val_loss)
+        else:
+            print(f"Ep {ep}/{epochs} train={train_loss:.3f}")
+            sched.step(train_loss)
+
+    torch.save(net.state_dict(), str(out))
+
+# ------------------------------- Predict -----------------------------
 
 def predict(model: Path, pattern: str):
-    dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu'); print('Using device:', dev)
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Using device:", dev)
     net = CRNN().to(dev)
     state = torch.load(model, map_location=dev, weights_only=True)
-    net.load_state_dict(state); net.eval()
+    net.load_state_dict(state)
+    net.eval()
+
     for p in sorted(Path().glob(pattern)):
         img = preprocess(p).unsqueeze(0).to(dev)
         with torch.no_grad():
-            print(f"{p.name:<20s} -> {decode(net(img))}")
+            txt = decode(net(img))
+        print(f"{p.name:<20s} -> {txt}")
 
-# ---------- main ------------------
+# --------------------------------- CLI --------------------------------
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(); subs = parser.add_subparsers(dest='cmd', required=True)
-    tr = subs.add_parser('train'); tr.add_argument('--data', type=Path, required=True); tr.add_argument('--epochs', type=int, default=30); tr.add_argument('--model', type=Path, default=Path('model.pth'))
-    pr = subs.add_parser('predict'); pr.add_argument('--model', type=Path, required=True); pr.add_argument('--imgs', type=str, default='captchas/*.png')
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    tr = sub.add_parser("train")
+    tr.add_argument("--data", type=Path, required=True)
+    tr.add_argument("--epochs", type=int, default=30)
+    tr.add_argument("--model", type=Path, default=Path("model.pth"))
+
+    pr = sub.add_parser("predict")
+    pr.add_argument("--model", type=Path, required=True)
+    pr.add_argument("--imgs", type=str, default="captchas/*.png")
+
     args = parser.parse_args()
-    if args.cmd == 'train':
+    if args.cmd == "train":
         train(args.data, args.epochs, args.model)
     else:
         predict(args.model, args.imgs)

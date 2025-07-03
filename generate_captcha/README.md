@@ -104,4 +104,4 @@ Running on GPU   # or CPU
 
 ## 6. License
 
-MIT (or change to your preferred license).
+MIT
