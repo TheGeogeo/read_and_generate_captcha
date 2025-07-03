@@ -1,0 +1,5 @@
+/generate_captcha/generated_captchas
+/read_captcha/captchas
+/read_captcha/dataset
+
+model.pth
