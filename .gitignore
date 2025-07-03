@@ -2,4 +2,5 @@
 /read_captcha/captchas
 /read_captcha/dataset
 
-model.pth
+/read_captcha/model.pth
+/read_captcha/svm.joblib
